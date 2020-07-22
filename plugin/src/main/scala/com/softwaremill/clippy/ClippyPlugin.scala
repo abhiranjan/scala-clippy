@@ -1,13 +1,26 @@
 package com.softwaremill.clippy
 
 import java.io.File
+import java.net.{URL, URLClassLoader}
 import java.util.concurrent.TimeoutException
 
+import scala.collection.JavaConverters._
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.reflect.internal.util.Position
 import scala.tools.nsc.Global
-import scala.tools.nsc.plugins.{Plugin, PluginComponent}
+import scala.tools.nsc.plugins.Plugin
+import scala.tools.nsc.plugins.PluginComponent
+import scala.tools.util.PathResolver
+
+final case class AdvicesAndWarnings(advices: List[Advice], fatalWarnings: List[Warning]) {
+  def ++(other: AdvicesAndWarnings): AdvicesAndWarnings =
+    copy(advices = advices ++ other.advices, fatalWarnings = fatalWarnings ++ other.fatalWarnings)
+}
+
+object AdvicesAndWarnings {
+  def empty: AdvicesAndWarnings = AdvicesAndWarnings(Nil, Nil)
+}
 
 class ClippyPlugin(val global: Global) extends Plugin {
 
@@ -15,23 +28,36 @@ class ClippyPlugin(val global: Global) extends Plugin {
 
   override val description: String = "gives good advice"
 
-  var url: String = ""
-  var enableColors = false
-  var testMode = false
-  val DefaultStoreDir = new File(System.getProperty("user.home"), ".clippy")
-  var localStoreDir = DefaultStoreDir
-  var projectRoot: Option[File] = None
+  var url: String                         = ""
+  var colorsConfig: ColorsConfig          = ColorsConfig.Disabled
+  var testMode                            = false
+  val DefaultStoreDir                     = new File(System.getProperty("user.home"), ".clippy")
+  var localStoreDir                       = DefaultStoreDir
+  var projectRoot: Option[File]           = None
+  var initialFatalWarnings: List[Warning] = Nil
+
+  lazy val localAdviceFiles = {
+    val classPathURLs = new PathResolver(global.settings).result.asURLs
+    val classLoader   = new URLClassLoader(classPathURLs.toArray, getClass.getClassLoader)
+    classLoader.getResources("clippy.json").asScala.toList
+  }
+
+  lazy val advicesAndWarnings =
+    loadAdvicesAndWarnings(url, localStoreDir, projectRoot, localAdviceFiles)
+
+  def getFatalWarningAdvice(warningText: String): Option[Warning] =
+    advicesAndWarnings.fatalWarnings.find(warning => warning.pattern.matches(ExactT(warningText)))
 
   def handleError(pos: Position, msg: String): String = {
-    val advices = loadAdvices(url, localStoreDir, projectRoot)
     val parsedMsg = CompilationErrorParser.parse(msg)
-    val matchers = advices.map(_.errMatching.lift)
-    val matches = matchers.flatMap(pf => parsedMsg.flatMap(pf))
+    val matchers  = advicesAndWarnings.advices.map(_.errMatching.lift)
+    val matches   = matchers.flatMap(pf => parsedMsg.flatMap(pf)).distinct
 
     matches.size match {
       case 0 =>
-        parsedMsg match {
-          case Some(tme: TypeMismatchError[ExactT]) if enableColors => prettyPrintTypeMismatchError(tme, msg)
+        (parsedMsg, colorsConfig) match {
+          case (Some(tme: TypeMismatchError[ExactT]), cc: ColorsConfig.Enabled) =>
+            prettyPrintTypeMismatchError(tme, cc)
           case _ => msg
         }
       case 1 =>
@@ -42,82 +68,150 @@ class ClippyPlugin(val global: Global) extends Plugin {
   }
 
   override def processOptions(options: List[String], error: (String) => Unit): Unit = {
-    enableColors = colorsFromOptions(options)
+    colorsConfig = colorsFromOptions(options)
     url = urlFromOptions(options)
     testMode = testModeFromOptions(options)
     localStoreDir = localStoreDirFromOptions(options)
     projectRoot = projectRootFromOptions(options)
-
+    initialFatalWarnings = initialFatalWarningsFromOptions(options)
     if (testMode) {
       val r = global.reporter
-      global.reporter = new DelegatingReporter(r, handleError)
+      global.reporter = new FailOnWarningsReporter(
+        new DelegatingReporter(r, handleError, colorsConfig),
+        getFatalWarningAdvice,
+        colorsConfig
+      )
     }
   }
 
-  override val components: List[PluginComponent] = List(
-    new InjectReporter(handleError, global) {
-      override def isEnabled = !testMode
-    }, new RestoreReporter(global) {
-      override def isEnabled = !testMode
-    }
-  )
+  override val components: List[PluginComponent] = {
 
-  private def prettyPrintTypeMismatchError(tme: TypeMismatchError[ExactT], msg: String): String = {
-    val plain = new StringDiff(tme.required.toString, tme.found.toString)
+    List(
+      new InjectReporter(handleError, getFatalWarningAdvice, global) {
+        override def colorsConfig = ClippyPlugin.this.colorsConfig
+        override def isEnabled    = !testMode
+      },
+      new RestoreReporter(global) {
+        override def isEnabled = !testMode
+      }
+    )
+  }
+
+  private def prettyPrintTypeMismatchError(tme: TypeMismatchError[ExactT], colors: ColorsConfig.Enabled): String = {
+    val colorDiff = (s: String) => colors.diff(s).toString
+    val plain     = new StringDiff(tme.found.toString, tme.required.toString, colorDiff)
 
     val expandsMsg = if (tme.hasExpands) {
-      val reqExpandsTo = tme.requiredExpandsTo.getOrElse(tme.required)
+      val reqExpandsTo   = tme.requiredExpandsTo.getOrElse(tme.required)
       val foundExpandsTo = tme.foundExpandsTo.getOrElse(tme.found)
-      val expands = new StringDiff(reqExpandsTo.toString, foundExpandsTo.toString)
+      val expands        = new StringDiff(foundExpandsTo.toString, reqExpandsTo.toString, colorDiff)
       s"""${expands.diff("\nExpanded types:\nfound   : %s\nrequired: %s\"")}"""
-    }
-    else
+    } else
       ""
 
     s""" type mismatch;
-         | Clippy advises:
-         | Pay attention to the parts marked in red:
-         | ${plain.diff("found   : %s\n required: %s")}$expandsMsg""".stripMargin
+         | Clippy advises, pay attention to the marked parts:
+         | ${plain.diff("found   : %s\n required: %s")}$expandsMsg${tme.notesAfterNewline}""".stripMargin
   }
 
   private def urlFromOptions(options: List[String]): String =
     options.find(_.startsWith("url=")).map(_.substring(4)).getOrElse("https://www.scala-clippy.org") + "/api/advices"
 
-  private def colorsFromOptions(options: List[String]): Boolean = boolFromOptions(options, "colors")
+  private def colorsFromOptions(options: List[String]): ColorsConfig =
+    if (boolFromOptions(options, "colors")) {
+
+      def colorToFansi(color: String): fansi.Attrs = color match {
+        case "black"         => fansi.Color.Black
+        case "light-gray"    => fansi.Color.LightGray
+        case "dark-gray"     => fansi.Color.DarkGray
+        case "red"           => fansi.Color.Red
+        case "light-red"     => fansi.Color.LightRed
+        case "green"         => fansi.Color.Green
+        case "light-green"   => fansi.Color.LightGreen
+        case "yellow"        => fansi.Color.Yellow
+        case "light-yellow"  => fansi.Color.LightYellow
+        case "blue"          => fansi.Color.Blue
+        case "light-blue"    => fansi.Color.LightBlue
+        case "magenta"       => fansi.Color.Magenta
+        case "light-magenta" => fansi.Color.LightMagenta
+        case "cyan"          => fansi.Color.Cyan
+        case "light-cyan"    => fansi.Color.LightCyan
+        case "white"         => fansi.Color.White
+        case "none"          => fansi.Attrs.Empty
+        case x =>
+          global.warning("Unknown color: " + x)
+          fansi.Attrs.Empty
+      }
+
+      val partColorPattern = "colors-(.*)=(.*)".r
+      options.filter(_.startsWith("colors-")).foldLeft(ColorsConfig.defaultEnabled) {
+        case (current, partAndColor) =>
+          val partColorPattern(part, colorStr) = partAndColor
+          val color                            = colorToFansi(colorStr.trim.toLowerCase())
+          part.trim.toLowerCase match {
+            case "diff"    => current.copy(diff = color)
+            case "comment" => current.copy(comment = color)
+            case "type"    => current.copy(`type` = color)
+            case "literal" => current.copy(literal = color)
+            case "keyword" => current.copy(keyword = color)
+            case "reset"   => current.copy(reset = color)
+            case x =>
+              global.warning("Unknown colored part: " + x)
+              current
+          }
+      }
+    } else ColorsConfig.Disabled
 
   private def testModeFromOptions(options: List[String]): Boolean = boolFromOptions(options, "testmode")
 
   private def boolFromOptions(options: List[String], option: String): Boolean =
-    options.find(_.startsWith(s"$option=")).map(_.substring(option.length + 1))
+    options
+      .find(_.startsWith(s"$option="))
+      .map(_.substring(option.length + 1))
       .getOrElse("false")
       .toBoolean
 
   private def projectRootFromOptions(options: List[String]): Option[File] =
-    options.find(_.startsWith("projectRoot=")).map(_.substring(12))
+    options
+      .find(_.startsWith("projectRoot="))
+      .map(_.substring(12))
       .map(new File(_, ".clippy.json"))
       .filter(_.exists())
+
+  private def initialFatalWarningsFromOptions(options: List[String]): List[Warning] =
+    options
+      .find(_.startsWith("fatalWarnings="))
+      .map(_.substring(14))
+      .map { str =>
+        str.split('|').toList.map(str => Warning(RegexT(str), text = None))
+      }
+      .getOrElse(Nil)
 
   private def localStoreDirFromOptions(options: List[String]): File =
     options.find(_.startsWith("store=")).map(_.substring(6)).map(new File(_)).getOrElse(DefaultStoreDir)
 
-  private def loadAdvices(url: String, localStoreDir: File, projectAdviceFile: Option[File]): List[Advice] = {
+  private def loadAdvicesAndWarnings(
+      url: String,
+      localStoreDir: File,
+      projectAdviceFile: Option[File],
+      localAdviceFiles: List[URL]
+  ): AdvicesAndWarnings = {
     implicit val ec = scala.concurrent.ExecutionContext.Implicits.global
 
     try {
-      Await
+      val clippyData = Await
         .result(
-          new AdviceLoader(global, url, localStoreDir, projectAdviceFile).load(),
+          new AdviceLoader(global, url, localStoreDir, projectAdviceFile, localAdviceFiles).load(),
           10.seconds
         )
-        .advices
-    }
-    catch {
+      AdvicesAndWarnings(clippyData.advices, clippyData.fatalWarnings ++ initialFatalWarnings)
+    } catch {
       case e: TimeoutException =>
         global.warning(s"Unable to read advices from $url and store to $localStoreDir within 10 seconds.")
-        Nil
+        AdvicesAndWarnings.empty
       case e: Exception =>
         global.warning(s"Exception when reading advices from $url and storing to $localStoreDir: $e")
-        Nil
+        AdvicesAndWarnings.empty
     }
   }
 }

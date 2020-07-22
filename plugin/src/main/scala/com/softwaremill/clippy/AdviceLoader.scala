@@ -10,43 +10,43 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.io.Source
 import scala.tools.nsc.Global
 import scala.util.{Failure, Success, Try}
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 
-class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdviceFile: Option[File])(implicit ec: ExecutionContext) {
+class AdviceLoader(
+    global: Global,
+    url: String,
+    localStoreDir: File,
+    projectAdviceFile: Option[File],
+    localAdviceFiles: List[URL]
+)(implicit ec: ExecutionContext) {
   private val OneDayMillis = 1000L * 60 * 60 * 24
 
   private val localStore = new File(localStoreDir, "clippy.json.gz")
 
-  private val resourcesAdvice: List[Advice] =
-    getClass.getClassLoader
-      .getResources("clippy.json")
-      .toList
-      .flatMap(loadAdviceFromUrL)
+  private lazy val resourcesAdvice: AdvicesAndWarnings =
+    localAdviceFiles.map(loadAdviceFromUrL).reduceOption(_ ++ _).getOrElse(AdvicesAndWarnings.empty)
 
-  private def loadAdviceFromUrL(url: URL): List[Advice] =
-    TryWith(url.openStream())(inputStreamToClippy(_).advices) match {
-      case Success(advices) => advices
+  private def loadAdviceFromUrL(url: URL): AdvicesAndWarnings =
+    TryWith(url.openStream())(inputStreamToClippy(_)) match {
+      case Success(clippyData) => AdvicesAndWarnings(clippyData.advices, clippyData.fatalWarnings)
       case Failure(_) =>
         global.inform(s"Cannot load advice from ${url.getPath} : Ignoring.")
-        Nil
+        AdvicesAndWarnings.empty
     }
 
-  private val projectAdvice: List[Advice] =
-    projectAdviceFile.map(file =>
-      loadAdviceFromUrL(file.toURI.toURL)).getOrElse(Nil)
+  private lazy val projectAdvice: AdvicesAndWarnings =
+    projectAdviceFile.map(file => loadAdviceFromUrL(file.toURI.toURL)).getOrElse(AdvicesAndWarnings.empty)
 
   def load(): Future[Clippy] = {
     val localClippy = if (!localStore.exists()) {
       fetchStoreParse()
-    }
-    else {
+    } else {
       val needsUpdate = System.currentTimeMillis() - localStore.lastModified() > OneDayMillis
 
       // fetching in the background
       val runningFetch = if (needsUpdate) {
         Some(fetchStoreParseInBackground())
-      }
-      else None
+      } else None
 
       val localLoad = Try(loadLocally()) match {
         case Success(v) => Future.successful(v)
@@ -61,8 +61,14 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
     }
 
     // Add in advice found in resources and project root
-    localClippy.map(clippy =>
-      clippy.copy(advices = (projectAdvice ++ resourcesAdvice ++ clippy.advices).distinct))
+    localClippy.map(
+      clippy =>
+        clippy.copy(
+          advices = (projectAdvice.advices ++ resourcesAdvice.advices ++ clippy.advices).distinct,
+          fatalWarnings =
+            (projectAdvice.fatalWarnings ++ resourcesAdvice.fatalWarnings ++ clippy.fatalWarnings).distinct
+      )
+    )
   }
 
   private def fetchStoreParse(): Future[Clippy] =
@@ -72,12 +78,12 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
         bytes
       }
       .map(bytes => inputStreamToClippy(decodeZippedBytes(bytes)))
-      .recover{
+      .recover {
         case e: Exception =>
           global.inform(s"Unable to load/store local Clippy advice due to: ${e.getMessage}")
-          Clippy(ClippyBuildInfo.version, Nil)
+          Clippy(ClippyBuildInfo.version, Nil, Nil)
       }
-      .andThen { case Success(v) => v.checkPluginVersion(ClippyBuildInfo.version, global.inform) }
+      .andThen { case Success(v) => v.checkPluginVersion(ClippyBuildInfo.version, println) }
 
   private def fetchStoreParseInBackground(): Future[Clippy] = {
     val f = fetchStoreParse()
@@ -88,14 +94,13 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
   }
 
   private def fetchCompressedJson(): Future[Array[Byte]] = Future {
-    val u = new URL(url)
+    val u    = new URL(url)
     val conn = u.openConnection().asInstanceOf[HttpURLConnection]
 
     try {
       conn.setRequestMethod("GET")
       inputStreamToBytes(conn.getInputStream)
-    }
-    finally conn.disconnect()
+    } finally conn.disconnect()
   }
 
   private def decodeZippedBytes(bytes: Array[Byte]): GZIPInputStream = new GZIPInputStream(decodeUtf8Bytes(bytes))
@@ -105,7 +110,8 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
   private def inputStreamToClippy(byteStream: InputStream): Clippy = {
     import org.json4s.native.JsonMethods._
     val data = Source.fromInputStream(byteStream, "UTF-8").getLines().mkString("\n")
-    Clippy.fromJson(parse(data))
+    Clippy
+      .fromJson(parse(data))
       .getOrElse(throw new IllegalArgumentException("Cannot deserialize Clippy data"))
   }
 
@@ -116,7 +122,7 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
     TryWith(new FileOutputStream(localStore))(_.write(bytes)).get
   }
 
-  private def storeLocallyInBackground(bytes: Array[Byte]): Unit = {
+  private def storeLocallyInBackground(bytes: Array[Byte]): Unit =
     Future {
       runNonDaemon {
         storeLocally(bytes)
@@ -124,7 +130,10 @@ class AdviceLoader(global: Global, url: String, localStoreDir: File, projectAdvi
     }.onFailure {
       case e: Exception => global.inform(s"Cannot store data at $localStore due to: $e")
     }
-  }
 
   private def loadLocally(source: File = localStore): Array[Byte] = inputStreamToBytes(new FileInputStream(source))
+}
+
+object AdviceLoader {
+  val localFile = "clippy.json.gz"
 }

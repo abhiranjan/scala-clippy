@@ -10,62 +10,106 @@
 <p>
     Did you ever see a Scala compiler error such as:
 </p>
-
-<pre>
-[error] TheNextFacebook.scala:16: type mismatch;
-[error]  found   : akka.http.scaladsl.server.StandardRoute
-[error]  required: akka.stream.scaladsl.Flow[akka.http.scaladsl.model.HttpRequest,akka.http.scaladsl.model.HttpResponse,Any]
-[error]   Http().bindAndHandle(r, "localhost", 8080)
-</pre>
-
+<img class="cout" src="assets/img/clippy-akka-err.png">
 <p>
     and had no idea what to do next? Well in this case, you need to provide an implicit instance of an <code>ActorMaterializer</code>,
     but the compiler isn't smart enough to be able to tell you that. Luckily, <strong>Scala Clippy is here to help</strong>!
 </p>
 
 <p>
-    Just add the Scala Clippy compiler plugin, and you'll see this additional helpful message:
+    Just add the Scala Clippy compiler plugin, and you'll see this additional helpful message, with optional additional colors:
 </p>
-
-<pre>
-[error]  Clippy advises: did you forget to define an implicit akka.stream.ActorMaterializer?
-[error]  It allows routes to be converted into a flow.
-[error]  You can read more at http://doc.akka.io/docs/akka-stream-and-http-experimental/2.0/scala/http/routing-dsl/index.html
-</pre>
+<img class="cout" src="assets/img/clippy-akka-err-rich.png">
 
 <h2>Adding the plugin</h2>
 
 <p>
     The easiest to use Clippy is via an SBT plugin. If you'd like Clippy to be enabled for all projects, without
-    the need to modify their build, add the following to <code>~/.sbt/0.13/plugins/build.sbt</code>:
+    the need to modify each project's build, add the following to <code>~/.sbt/0.13/plugins/build.sbt</code>:
 </p>
 
 <pre>
-addSbtPlugin("com.softwaremill.clippy" % "plugin-sbt" % "0.4.1")
+addSbtPlugin("com.softwaremill.clippy" % "plugin-sbt" % "0.6.1")
 </pre>
 
 <p>
-    Upon first use, the plugin will download the advice dataset from <code>https://scala-clippy.org</code> and store it
-    in the <code>$HOME/.clippy</code> directory. The dataset will be updated at most once a day, in the background.
+    Upon first use, the plugin will download the advice dataset from <code>https://scala-clippy.org</code> and store it in the
+    <code>$HOME/.clippy</code> directory. The dataset will be updated at most once a day, in the background. You can customize the
+    dataset URL and local store by setting the <code>clippyUrl</code> and <code>clippyLocalStoreDir</code> sbt options to non-<code>None</code>-values.
 </p>
 
+<p>
+    Note: to customize a global sbt plugin (a plugin which is added via `~/.sbt/0.13/plugins/build.sbt`) keep in mind
+    that:
+</p>
 
-<h2>Enabling colored type mismatch diffs</h2>
+<ul>
+    <li>customize the plugin settings in <code>~/.sbt/0.13/build.sbt</code> (one directory up!). These settings will be
+    automatically added to all of your projects.</li>
+    <li>you'll need to add <code>import com.softwaremill.clippy.ClippySbtPlugin._</code> to access the setting names as auto-imports
+    don't work in the global settings</li>
+    <li>the clippy sbt settings are just a convenient syntax for adding compiler options (e.g., enabling colors is same
+    as <code>scalacOptions += "-P:clippy:colors=true"</code>)</li>
+</ul>
+
+<h2>(NEW!) Turning selected compilation warnings into errors</h2>
+<p>
+    From version 0.6.0 you can selectively define regexes for warnings which will be treated as fatal compilation errors. To do so with sbt,
+    use the <code>clippyFatalWarnings</code> setting, for example:
+</p>
+<pre>
+    import com.softwaremill.clippy.ClippySbtPlugin.WarningPatterns._
+    // ...
+    settings(
+      clippyFatalWarnings ++= List(
+        NonExhaustiveMatch,
+        ".*\\[wartremover:.*\\].*[\\s\\S]*"
+      )
+    )
+</pre>
+<p>
+    You can also define fatal warnings in your .clippy.json file (see further sections for examples).
+</p>
+
+<h2>Enabling syntax and type mismatch diffs highlighting</h2>
 
 <p>
-    For type mismatch errors, Clippy can compute and show a colored diff between expected and actual types. This may be
-    especially helpful for long type signatures. If you'd like to enable this feature, add the
-    <code>-P:clippy:colors=true</code> compiler option.
+    Clippy can highlight:
+</p>
 
-    If you're using the SBT plugin, you can enable coloring globally by adding the following line to
-    <code>~/.sbt/0.13/clippy.sbt</code> (these are your local SBT settings, they will apply to all projects):
+<ul>
+    <li>
+        in type mismatch errors, the diff between expected and actual types. This may be especially helpful for long type
+        signatures
+    </li>
+    <li>
+        syntax when displaying code fragments with errors. Example:
+        <img class="cout" src="assets/img/clippy-syntax-highlight.png">
+    </li>
+</ul>
+
+<p>
+    If you'd like to enable this feature in sbt globally, add the following to `~/.sbt/0.13/build.sbt`: (see also notes
+    above)
 </p>
 
 <pre>
-    scalacOptions += "-P:clippy:colors=true"
+import com.softwaremill.clippy.ClippySbtPlugin._ // needed in global configuration only
+clippyColorsEnabled := true
 </pre>
 
-<h2>Contributing</h2>
+<p>
+    To customize the colors, set any of `clippyColorDiff`, `clippyColorComment`,
+    `clippyColorType`, `clippyColorLiteral`, `clippyColorKeyword` to `Some(ClippyColor.[name])`, where `[name]` can be:
+    `Black`, `Red`, `Green`, `Yellow`, `Blue`, `Magenta`, `Cyan`, `White` or `None`.
+</p>
+
+<p>
+    You can of course add clippy on a per-project basis as well.
+</p>
+<h3>Windows users</h3>
+<p>If you notice that colors don't get correctly reset, that's probably caused by problems with interpreting the standard ANSI Reset code. You can set `clippyColorReset` to a custom value like `LightGray` to solve this issue.</p>
+<h2>Contributing advice</h2>
 
 <p>
     Help others users by submitting an advice for a compilation error that you have encountered!
@@ -82,12 +126,48 @@ addSbtPlugin("com.softwaremill.clippy" % "plugin-sbt" % "0.4.1")
     <a href="https://github.com/softwaremill/scala-clippy">source code</a>.
 </p>
 
-<h2>Project-specific advices</h2>
+<h2>Project-specific advices and fatal warnings</h2>
 
-<p>
-    If you have advice that you feel is too specific to be worth sharing on global database, you can add it to
-    your project specific advice file. Just create a file named .clippy.json in the root of your project directory.
-    See clippy <a href="https://github.com/softwaremill/scala-clippy#project-specific-advice">README</a> for an example.</p>
+<p>If you have advice that you feel is too specific to be worth sharing publicly, you can add
+  it to your project specific advice file. First set your project root:
+</p>
+<pre>
+clippyProjectRoot := Some((baseDirectory in ThisBuild).value) 
+</pre>
+
+Then create a file named .clippy.json in the root of your project directory and add the advice json in the format illustrated below:
+
+<pre>
+{
+  "version": "1",
+  "advices": [
+    {
+      "error": {
+        "type": "typeMismatch",
+        "found": "scala\\.concurrent\\.Future\\[Int\\]",
+        "required": "Int"
+      },
+      "text": "Maybe you used map where you should have used flatMap?",
+      "library": {
+        "groupId": "scala.lang",
+        "artifactId": "Future",
+        "version": "1.0"
+      }
+    }
+  ],
+  "fatalWarnings": [
+    {
+      "pattern": "match may not be exhaustive[\\s\\S]*",
+      "text": "Additional optional text to be displayed"
+    }
+  ]
+}
+</pre>
+<h2>Library-specific advice</h2>
+If you have advice that is specific to a library or library version you can also bundle the advice with your library.
+If your users have Scala-Clippy installed they will see your advice if your library is inclued in their project.
+This can be helpful in the common case where users of your library need specific imports to be able to use your functionality.
+To bundle clippy advice with your library just put it in a file named clippy.json in your resources directory.
 
 <h2>Alternative ways to use Clippy</h2>
 
@@ -97,7 +177,7 @@ addSbtPlugin("com.softwaremill.clippy" % "plugin-sbt" % "0.4.1")
 </p>
 
 <pre>
-addCompilerPlugin("com.softwaremill.clippy" %% "plugin" % "0.4.1" classifier "bundle")
+addCompilerPlugin("com.softwaremill.clippy" %% "plugin" % "0.6.1" classifier "bundle")
 </pre>
 
 <p>
@@ -105,5 +185,9 @@ addCompilerPlugin("com.softwaremill.clippy" %% "plugin" % "0.4.1" classifier "bu
 </p>
 
 <pre>
--Xplugin:clippy-plugin_2.11-0.4.1-bundle.jar
+-Xplugin:clippy-plugin_2.11-0.6.1-bundle.jar
 </pre>
+
+<p>
+    See clippy <a href="https://github.com/softwaremill/scala-clippy">README</a> for more details.</p>
+</p>
